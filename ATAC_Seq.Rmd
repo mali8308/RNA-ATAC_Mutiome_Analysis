@@ -1,0 +1,257 @@
+
+
+
+```{r}
+
+suppressPackageStartupMessages({
+library(Signac)
+library(Seurat)
+library(ggplot2)
+library(EnsDb.Mmusculus.v79)
+library(BSgenome.Mmusculus.UCSC.mm10)
+library(celldex)
+library(SingleR)
+})
+
+```
+
+
+```{r}
+
+suppressWarnings({
+Mixed_RNA_ATAC_seq = Read10X("/Users/ali/Downloads/GSE262477_RAW/")
+frag_path = "/Users/ali/Downloads/GSE262477_RAW/atac_fragments.tsv.gz"
+annotation = GetGRangesFromEnsDb(ensdb = EnsDb.Mmusculus.v79)
+seqlevels(annotation) = paste0('chr', seqlevels(annotation))
+})
+
+
+```
+
+
+```{r}
+
+snare = CreateSeuratObject(counts = Mixed_RNA_ATAC_seq$`Gene Expression`,
+                           assay = "RNA")
+
+snare[["pct_mito"]] = PercentageFeatureSet(snare, pattern = "^mt-")
+
+snare[['ATAC']] = CreateChromatinAssay(counts = Mixed_RNA_ATAC_seq$Peaks,
+                                       sep = c(":", "-"),
+                                       fragments = frag_path,
+                                       annotation = annotation)
+
+```
+
+```{r}
+
+suppressWarnings({VlnPlot(snare, features = c("nFeature_RNA", "nCount_RNA", "pct_mito"), 
+                          ncol = 3,
+                          pt.size = 0)})
+
+# filter out low quality cells
+snare = subset(x = snare,
+               subset = nFeature_RNA < 4000 & nFeature_RNA > 300 & pct_mito < 15)
+
+suppressWarnings({VlnPlot(snare, features = c("nFeature_RNA", "nCount_RNA", "pct_mito"), 
+                          ncol = 3,
+                          pt.size = 0)})
+                 
+```
+
+```{r}
+
+CellDex_Data = as.data.frame(surveyReferences())
+
+imgen_ref = fetchReference("immgen", version = "2024-02-26")
+ref_labels = imgen_ref$label.fine
+
+```
+Common genes between the two datasets
+
+```{r}
+
+length(intersect(rownames(snare), rownames(imgen_ref)))
+
+exp_mat = as.matrix(LayerData(snare, 
+                              assay = "RNA", 
+                              layer = "counts"))
+
+singler_pred = SingleR(test = exp_mat,
+                       ref = imgen_ref,
+                       labels = ref_labels)
+
+
+snare = AddMetaData(snare, as.data.frame(singler_pred))
+
+table(snare@meta.data$labels)
+      
+```
+
+
+
+```{r}
+
+DefaultAssay(snare) = "ATAC"
+
+snare = NucleosomeSignal(snare)
+snare = TSSEnrichment(snare)
+
+snare = subset(x = snare,
+                 nCount_ATAC < 20000 & nCount_ATAC > 8000 &
+                 nCount_RNA < 10000 & nCount_RNA > 300 &
+                 nucleosome_signal < 2 & TSS.enrichment > 1)
+
+
+```
+
+```{r}
+
+DensityScatter(snare, x = 'nCount_ATAC', y = 'TSS.enrichment', log_x = TRUE, quantiles = TRUE)
+
+```
+
+```{r}
+
+VlnPlot(object = snare,
+        features = c("nCount_RNA", "nCount_ATAC", "TSS.enrichment", "nucleosome_signal"),
+        ncol = 4,
+        pt.size = 0)
+
+```
+
+```{r}
+
+# filter out low quality cells
+snare = subset(x = snare,
+               subset = nCount_ATAC < 20000 & nCount_ATAC > 8000 &
+                 nCount_RNA < 20000 & nCount_RNA > 300 &
+                 nucleosome_signal < 2 & TSS.enrichment > 1)
+
+snare
+
+```
+```{r}
+
+DefaultAssay(snare) = "RNA"
+
+snare = SCTransform(snare,
+                    assay = "RNA")
+
+snare = RunPCA(snare, 
+               assay = "SCT")
+
+```
+
+```{r}
+
+DefaultAssay(snare) = "ATAC"
+
+snare = FindTopFeatures(snare, 
+                        min.cutoff = 5,
+                        assay = "ATAC")
+
+snare = RunTFIDF(snare,
+                 assay = "ATAC")
+
+snare = RunSVD(snare,
+               assay = "ATAC")
+
+```
+
+```{r}
+
+# build a joint neighbor graph using both assays
+snare = FindMultiModalNeighbors(object = snare,
+                                reduction.list = list("pca", "lsi"), 
+                                dims.list = list(1:50, 2:40),
+                                modality.weight.name = "RNA.weight",
+                                verbose = TRUE)
+
+# build a joint UMAP visualization
+snare = RunUMAP(object = snare,
+                nn.name = "weighted.nn",
+                assay = "RNA",
+                verbose = TRUE)
+
+DimPlot(snare, label = TRUE, repel = TRUE, reduction = "umap") + 
+  NoLegend()
+
+```
+
+```{r}
+
+library(AnnotationFilter)
+gene_info = genes(EnsDb.Mmusculus.v79, filter = GeneNameFilter(c("Runx1", "Klf6")))
+
+print(gene_info)
+
+```
+
+
+```{r}
+
+
+DefaultAssay(snare) = "ATAC"
+
+# first compute the GC content for each peak
+snare = RegionStats(snare, 
+                    genome = BSgenome.Mmusculus.UCSC.mm10)
+
+genome(snare[["ATAC"]]) = "mm10"
+
+# link peaks to genes
+snare = LinkPeaks(object = snare,
+                  peak.assay = "ATAC",
+                  expression.assay = "SCT",
+                  genes.use = c("Runx1", "Klf6"))
+
+
+
+```
+```{r}
+idents.plot <- c("B naive", "B intermediate", "B memory",
+                 "CD14 Mono", "CD16 Mono", "CD8 TEM", "CD8 Naive")
+
+pbmc <- SortIdents(pbmc)
+
+Runx1_plot = CoveragePlot(object = snare,
+                          region = "Runx1",
+                          features = "Runx1",
+                          expression.assay = "SCT",
+                          #idents = idents.plot,
+                          extend.upstream = 500,
+                          extend.downstream = 10000)
+
+Runx1_plot
+
+
+p2 <- CoveragePlot(
+  object = pbmc,
+  region = "LYZ",
+  features = "LYZ",
+  expression.assay = "SCT",
+  idents = idents.plot,
+  extend.upstream = 8000,
+  extend.downstream = 5000
+)
+
+patchwork::wrap_plots(p1, p2, ncol = 1)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
